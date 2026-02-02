@@ -7,8 +7,11 @@
 
 ## 설치
 
-```bash
-claude skill add nathankim0/easy-hwp
+Claude Code에서:
+
+```
+/plugin marketplace add nathankim0/easy-hwp
+/plugin install easy-hwp@nathankim0-easy-hwp
 ```
 
 ## 사용법

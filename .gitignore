@@ -1,24 +1,3 @@
-# Python
-__pycache__/
-*.py[cod]
-*$py.class
-*.so
-.Python
-venv/
-.venv/
-
-# Root Python files (moved to plugins/easy-hwp/lib/)
-/hwpx_parser.py
-/hwp_parser.py
-/hwp_core.py
-
-# Test files
-test_hwpx/
-IRB서식_*.hwpx
-*_structure.md
-테스트_*.md
-tests/fixtures/output.hwpx
-
 # IDE
 .idea/
 .vscode/
@@ -28,3 +7,10 @@ tests/fixtures/output.hwpx
 # OS
 .DS_Store
 Thumbs.db
+
+# 임시 파일
+*.tmp
+temp_*/
+
+# 템플릿 디렉토리 (개인 서식)
+templates/

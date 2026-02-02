@@ -8,12 +8,66 @@ description: 한글 파일(.hwpx)의 구조를 분석합니다. "hwpx 분석", "
 ## 입력
 $ARGUMENTS
 
-## 해야 할 일
+## HWPX 파일 구조
 
-1. **HWPX 파일 열기**: ZIP 형식이므로 압축 해제하여 `Contents/section*.xml` 확인
-2. **표 구조 파악**: XML에서 표(`tbl`), 행(`tr`), 셀(`tc`) 찾아서 내용 추출
-3. **필드 식별**: 2열 표에서 첫 번째 열은 필드명, 두 번째 열은 값으로 인식
-4. **빈 필드 구분**: 값이 비어있는 필드 = 채워야 할 항목
+HWPX는 ZIP 형식의 압축 파일입니다.
+
+```
+hwpx파일/
+├── Contents/
+│   ├── section0.xml    # 본문 내용 (첫 번째 섹션)
+│   ├── section1.xml    # 추가 섹션 (있는 경우)
+│   └── header.xml      # 헤더 정보
+├── settings.xml        # 문서 설정
+└── mimetype            # 파일 타입 정보
+```
+
+## 처리 절차
+
+### 1. 압축 해제
+
+```bash
+unzip -o {파일}.hwpx -d {임시디렉토리}/
+```
+
+### 2. XML 읽기
+
+`Contents/section0.xml` 파일을 Read 도구로 읽습니다.
+
+### 3. XML 구조 분석
+
+**네임스페이스**: `hp` = `http://www.hancom.co.kr/hwpml/2011/paragraph`
+
+**주요 태그**:
+| 태그 | 의미 |
+|------|------|
+| `<hp:tbl>` | 표 (table) |
+| `<hp:tr>` | 행 (table row) |
+| `<hp:tc>` | 셀 (table cell) |
+| `<hp:t>` | 텍스트 내용 |
+| `<hp:p>` | 문단 (paragraph) |
+
+**표 구조 예시**:
+```xml
+<hp:tbl>
+  <hp:tr>
+    <hp:tc><hp:p><hp:t>필드명</hp:t></hp:p></hp:tc>
+    <hp:tc><hp:p><hp:t>값</hp:t></hp:p></hp:tc>
+  </hp:tr>
+</hp:tbl>
+```
+
+### 4. 필드 추출
+
+2열 표에서:
+- 첫 번째 열(`tc[1]`): 필드명
+- 두 번째 열(`tc[2]`): 값 (비어있으면 채워야 할 항목)
+
+### 5. 임시 파일 정리
+
+```bash
+rm -rf {임시디렉토리}
+```
 
 ## 사용자에게 알려줄 것
 

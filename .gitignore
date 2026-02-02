@@ -7,6 +7,11 @@ __pycache__/
 venv/
 .venv/
 
+# Root Python files (moved to plugins/easy-hwp/lib/)
+/hwpx_parser.py
+/hwp_parser.py
+/hwp_core.py
+
 # Test files
 test_hwpx/
 IRB서식_*.hwpx

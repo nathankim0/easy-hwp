@@ -17,6 +17,7 @@ test_hwpx/
 IRB서식_*.hwpx
 *_structure.md
 테스트_*.md
+tests/fixtures/output.hwpx
 
 # IDE
 .idea/

@@ -8,127 +8,131 @@ description: 한글 서식 파일(.hwpx)에 내용을 채워 새 문서를 생�
 ## 사용법
 
 ```
-/hwp-fill [템플릿경로|템플릿이름] [내용파일.md]
+/hwp-fill [서식파일.hwpx] [내용파일.md]
 ```
 
 ## 입력
 
 $ARGUMENTS
 
-## 입력 형식
+## 핵심 동작 원리
 
-### 1. 템플릿 + MD 파일
+1. **서식 파일 분석**: HWPX 파일의 표에서 필드명(첫 번째 열) 추출
+2. **내용 파일 파싱**: MD 파일의 헤더(`#`, `##`)를 필드명으로, 아래 내용을 값으로 추출
+3. **스마트 매칭**: 필드명을 유연하게 매칭 (아래 규칙 참조)
+4. **내용 채우기**: 매칭된 필드에 값을 채워서 새 파일 생성
+
+## 스마트 필드 매칭 규칙
+
+**중요**: 필드명이 정확히 일치하지 않아도 다음 규칙으로 매칭하세요.
+
+### 자동 매칭 (확신 높음)
+- 정확히 일치: `연구과제명` = `연구과제명`
+- 부분 포함: `과제명` → `연구과제명` 매칭 가능
+- 동의어/유사어: `책임자` ≈ `연구책임자`, `기간` ≈ `연구기간`
+- 띄어쓰기/특수문자 무시: `연구 과제명` = `연구과제명`
+
+### 사용자 확인 필요 (애매한 경우)
+다음 상황에서는 **반드시 사용자에게 확인**하세요:
+- 여러 필드에 매칭될 수 있는 경우
+- 유사하지만 의미가 다를 수 있는 경우
+- 매칭할 필드를 찾지 못한 경우
+
+**확인 예시**:
 ```
-/hwp-fill IRB서식.hwpx 연구계획.md
+MD의 "목적"을 다음 중 어디에 채울까요?
+1. 연구목적
+2. 사업목적
+3. 기타 (직접 입력)
 ```
 
-### 2. 대화로 내용 입력
-```
-/hwp-fill IRB서식.hwpx
-(이후 대화로 내용 입력)
-```
+### 매칭 불가
+- 서식에 해당 필드가 없으면 사용자에게 알림
+- 필요시 새 필드 추가 여부 확인
 
 ## 실행 절차
 
-1. **템플릿 확인**: 파일 존재 여부 확인
+### 1단계: 서식 분석
+```python
+import zipfile
+from xml.etree import ElementTree as ET
 
-2. **내용 소스 확인**:
-   - MD 파일 제공시: 파일 내용 파싱
-   - 없으면: 사용자에게 내용 입력 요청
+def get_hwpx_fields(file_path):
+    """HWPX에서 필드명 목록 추출"""
+    fields = []
+    with zipfile.ZipFile(file_path, 'r') as zf:
+        for name in zf.namelist():
+            if 'section' in name and name.endswith('.xml'):
+                root = ET.fromstring(zf.read(name))
+                ns = 'http://www.hancom.co.kr/hwpml/2011/paragraph'
+                for tr in root.findall(f'.//{{{ns}}}tr'):
+                    cells = list(tr.findall(f'.//{{{ns}}}tc'))
+                    if len(cells) >= 2:
+                        # 첫 번째 셀에서 텍스트 추출
+                        texts = [t.text for t in cells[0].iter() if t.tag.endswith('}t') and t.text]
+                        field_name = ' '.join(texts).strip()
+                        if field_name:
+                            fields.append(field_name)
+    return fields
+```
 
-3. **MD 파일 파싱**: 헤더를 필드명으로, 내용을 값으로 추출
+### 2단계: MD 파싱
 ```python
 import re
 
-def parse_markdown(md_content):
-    content_dict = {}
+def parse_md(content):
+    """MD에서 필드-값 추출"""
+    result = {}
     pattern = r'^#{1,2}\s+(.+?)$\s*((?:(?!^#{1,2}\s).+\n?)*)'
-    matches = re.findall(pattern, md_content, re.MULTILINE)
-    for field_name, field_value in matches:
-        content_dict[field_name.strip()] = field_value.strip()
-    return content_dict
+    for field, value in re.findall(pattern, content, re.MULTILINE):
+        result[field.strip()] = value.strip()
+    return result
 ```
 
-4. **필드 매칭 확인**: 매칭 결과를 사용자에게 보여주고 확인
+### 3단계: 스마트 매칭
+1. 서식 필드 목록과 MD 필드 목록 비교
+2. 위 매칭 규칙에 따라 매칭
+3. 애매한 것은 사용자에게 확인
+4. 최종 매핑 테이블 생성
 
-5. **문서 채우기**:
+### 4단계: 내용 채우기
 ```python
-import zipfile
-import shutil
-import os
-from xml.etree import ElementTree as ET
-
-def fill_hwpx(template_path, content_dict, output_path):
-    shutil.copy2(template_path, output_path)
-    temp_dir = output_path + "_temp"
-    os.makedirs(temp_dir, exist_ok=True)
-
-    try:
-        with zipfile.ZipFile(output_path, 'r') as zf:
-            zf.extractall(temp_dir)
-
-        # section XML 수정
-        contents_dir = os.path.join(temp_dir, 'Contents')
-        for f in os.listdir(contents_dir):
-            if f.startswith('section') and f.endswith('.xml'):
-                section_path = os.path.join(contents_dir, f)
-                tree = ET.parse(section_path)
-                root = tree.getroot()
-
-                # 표 내 셀 채우기
-                ns = 'http://www.hancom.co.kr/hwpml/2011/paragraph'
-                for tbl in root.findall(f'.//{{{ns}}}tbl'):
-                    for tr in tbl.findall(f'.//{{{ns}}}tr'):
-                        cells = list(tr.findall(f'.//{{{ns}}}tc'))
-                        if len(cells) >= 2:
-                            # 첫 셀: 필드명, 둘째 셀: 값
-                            field_name = get_cell_text(cells[0])
-                            if field_name in content_dict:
-                                set_cell_text(cells[1], content_dict[field_name])
-
-                tree.write(section_path, encoding='utf-8', xml_declaration=True)
-
-        # 다시 압축
-        os.remove(output_path)
-        with zipfile.ZipFile(output_path, 'w', zipfile.ZIP_DEFLATED) as zf:
-            for root_dir, dirs, files in os.walk(temp_dir):
-                for file in files:
-                    file_path = os.path.join(root_dir, file)
-                    arc_name = os.path.relpath(file_path, temp_dir)
-                    zf.write(file_path, arc_name)
-    finally:
-        shutil.rmtree(temp_dir)
-
-    return output_path
+def fill_hwpx(template_path, field_mapping, output_path):
+    """매핑에 따라 내용 채우기"""
+    # template 복사 → XML 수정 → 재압축
 ```
 
-6. **결과 안내**: 생성된 파일 경로 안내
+## 사용자 경험 최적화
 
-## MD 파일 형식
+### DO (해야 할 것)
+- 매칭 결과를 먼저 보여주고 확인 받기
+- 채울 수 없는 필드가 있으면 알려주기
+- 완료 후 어떤 필드가 채워졌는지 요약
 
-```markdown
-# 연구과제명
-스마트 헬스케어 시스템 개발
+### DON'T (하지 말 것)
+- 애매한 매칭을 사용자 확인 없이 진행하지 않기
+- MD 형식이 이상해도 최대한 해석 시도하기
+- 에러 발생 시 기술적 메시지 대신 쉬운 설명 제공
 
-## 연구책임자
-홍길동
+## 출력 예시
 
-## 연구기간
-2024.01.01 ~ 2024.12.31
+```
+📋 매칭 결과:
+
+✅ 자동 매칭됨:
+  - "과제명" → 연구과제명
+  - "책임자" → 연구책임자
+  - "기간" → 연구기간
+
+❓ 확인 필요:
+  - "목적": 연구목적 / 사업목적 중 어디에 채울까요?
+
+⚠️ 매칭 안됨:
+  - "참고문헌": 서식에 해당 필드가 없습니다
+
+진행할까요?
 ```
 
 ## 출력 파일
 
 기본: `{원본파일명}_filled.hwpx`
-
-## 필드 매칭 예시
-
-```
-템플릿 필드          ←  MD 섹션
-──────────────────────────────────
-연구과제명           ←  # 연구과제명
-연구책임자           ←  ## 연구책임자
-연구기간             ←  ## 연구기간
-```
-
-매칭 결과를 사용자에게 보여주고 확인 후 진행합니다.

@@ -1,0 +1,349 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<title>claw-hwp preview</title>
+<style>
+  /* Dark base palette — oklch low-chroma
+     blue-gray). The 자동 보정 toggle and primary button use slightly raised
+     greys instead of a colored accent — keeps the chrome calm and lets the
+     rendered HWP page stay the visual focus. */
+  :root {
+    --bg:            oklch(0.18 0.004 240);
+    --surface:       oklch(0.22 0.005 240);
+    --surface-elev:  oklch(0.26 0.006 240);
+    --border:        oklch(0.32 0.006 240);
+    --border-strong: oklch(0.42 0.008 240);
+    --text:          oklch(0.95 0.003 240);
+    --text-dim:      oklch(0.72 0.006 240);
+    --text-muted:    oklch(0.55 0.006 240);
+    --error: #F87171;
+  }
+  * { box-sizing: border-box; }
+  html, body {
+    margin: 0; padding: 0;
+    background: var(--bg);
+    color: var(--text);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Pretendard", "Apple SD Gothic Neo", sans-serif;
+    font-size: 13px;
+    height: 100%;
+  }
+  body { display: flex; flex-direction: column; height: 100vh; }
+  .toolbar {
+    flex: 0 0 auto;
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    padding: 8px 14px;
+    background: var(--surface);
+    border-bottom: 1px solid var(--border);
+  }
+  .filename {
+    font-size: 12px;
+    color: var(--text-muted);
+    flex: 1 1 auto;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .autofix {
+    background: transparent;
+    color: var(--text-muted);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    padding: 4px 10px;
+    font-size: 11px;
+    cursor: pointer;
+    font-weight: 500;
+  }
+  .autofix.on {
+    background: var(--surface-elev);
+    color: var(--text);
+    border-color: var(--border-strong);
+  }
+  .autofix:hover:not(.on) { background: var(--surface-elev); }
+
+  /* Page nav (< [n] / total >). Layout-side mirror of hop's bottom-bar
+     navigator but inlined into the toolbar. The number input is a real
+     <input type="number"> so users can type a page number directly. */
+  .pagenav {
+    display: flex; align-items: center; gap: 6px;
+    color: var(--text-muted);
+    font-size: 11px;
+    line-height: 1;
+    font-variant-numeric: tabular-nums;
+  }
+  /* Borderless arrow buttons — clean glyph, hover hint only. */
+  .pagenav button {
+    background: transparent;
+    border: none;
+    color: var(--text);
+    width: 20px; height: 20px;
+    display: flex; align-items: center; justify-content: center;
+    cursor: pointer;
+    padding: 0;
+    font-size: 14px;
+    line-height: 1;
+    border-radius: 3px;
+  }
+  .pagenav button:hover:not(:disabled) { color: var(--text); background: var(--surface-elev); }
+  .pagenav button:disabled { opacity: 0.35; cursor: not-allowed; }
+  .pagenav input {
+    background: var(--surface-elev);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    color: var(--text);
+    width: 36px;
+    height: 20px;
+    text-align: center;
+    padding: 0 4px;
+    font: inherit;
+    font-size: 11px;
+    line-height: 1;
+    font-variant-numeric: tabular-nums;
+    -moz-appearance: textfield;
+  }
+  .pagenav input::-webkit-outer-spin-button,
+  .pagenav input::-webkit-inner-spin-button {
+    -webkit-appearance: none; margin: 0;
+  }
+  .pagenav .total {
+    color: var(--text-muted);
+    font: inherit;
+    font-size: 11px;
+    line-height: 1;
+    font-variant-numeric: tabular-nums;
+  }
+
+  /* Download icon (anchor styled as a button) */
+  .download {
+    background: transparent;
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    color: var(--text);
+    width: 26px; height: 26px;
+    display: inline-flex; align-items: center; justify-content: center;
+    cursor: pointer;
+    text-decoration: none;
+  }
+  .download:hover { background: var(--surface-elev); }
+  .download svg { width: 14px; height: 14px; }
+
+  main {
+    flex: 1 1 auto;
+    overflow: auto;
+    padding: 24px;
+    display: flex;
+    flex-direction: column;
+    /* `safe center` keeps pages horizontally centered while they fit, and
+       falls back to flex-start when they don't (zoomed in past the pane
+       width) — so the user can still scroll to the left edge of an
+       oversized page. Plain `center` would clip the left edge. */
+    align-items: safe center;
+    gap: 16px;
+  }
+  /* JS sets all geometry inline — wrap sized
+     in native page px on render, fit() rescales via CSS without
+     re-rasterising. Canvas is absolutely positioned inside the wrap.
+     flex-shrink:0 because <main> is a column flexbox; without it each
+     page's inline height gets crushed by flex-shrink:1 when the total
+     page stack exceeds the container, which folded every page down to
+     ~120px regardless of the inline height. */
+  .hwp-page { line-height: 0; flex: 0 0 auto; }
+  .hwp-page canvas { display: block; }
+  .status {
+    color: var(--text-muted);
+    font-size: 12px;
+    padding: 32px;
+  }
+  .status.error { color: var(--error); }
+
+  /* Hover tooltips — shared shape, just different anchors:
+     - .autofix-wrap (right-aligned beneath the toolbar's autofix button)
+     - .info-wrap (left-aligned beneath the leading ⓘ icon)
+     The wrap is the hover host so the tip appears whether the cursor is on
+     the button or the tip itself; pointer-events stays enabled so users can
+     read longer tips without it disappearing. */
+  .autofix-wrap, .info-wrap { position: relative; display: inline-flex; }
+  .autofix-tip, .info-tip {
+    position: absolute;
+    top: calc(100% + 6px);
+    width: 240px;
+    padding: 8px 10px;
+    background: var(--surface-elev);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    font-size: 11px;
+    line-height: 1.5;
+    color: var(--text-dim);
+    box-shadow: 0 4px 14px rgba(0, 0, 0, 0.45);
+    visibility: hidden;
+    opacity: 0;
+    transition: opacity 80ms ease, visibility 80ms ease;
+    z-index: 30;
+  }
+  .autofix-tip { right: 0; }
+  .info-tip { left: 0; }
+  .autofix-wrap:hover .autofix-tip,
+  .autofix-wrap:focus-within .autofix-tip,
+  .info-wrap:hover .info-tip,
+  .info-wrap:focus-within .info-tip { visibility: visible; opacity: 1; }
+  /* Leading info button — borderless circle that visually reads as a hint,
+     not an action. Same hit-target conventions as the download/pagenav. */
+  .info-btn {
+    background: transparent;
+    border: none;
+    color: var(--text-muted);
+    width: 22px; height: 22px;
+    display: inline-flex; align-items: center; justify-content: center;
+    cursor: help;
+    padding: 0;
+    border-radius: 3px;
+    flex: 0 0 auto;
+  }
+  .info-btn:hover { color: var(--text-dim); background: var(--surface-elev); }
+  .info-btn svg { width: 14px; height: 14px; }
+
+  /* Zoom controls — slider + clickable percentage. Sized compact so the
+     toolbar doesn't overflow on narrow Code panes. The percentage label
+     doubles as a reset button: click to snap back to 100%. */
+  .zoom {
+    display: flex; align-items: center; gap: 6px;
+    color: var(--text-muted);
+    font-size: 11px;
+    line-height: 1;
+    font-variant-numeric: tabular-nums;
+    flex: 0 0 auto;
+  }
+  .zoom input[type="range"] {
+    -webkit-appearance: none;
+    appearance: none;
+    width: 92px;
+    height: 18px;
+    background: transparent;
+    cursor: pointer;
+    padding: 0;
+    margin: 0;
+  }
+  .zoom input[type="range"]::-webkit-slider-runnable-track {
+    height: 3px;
+    background: var(--border-strong);
+    border-radius: 2px;
+  }
+  .zoom input[type="range"]::-moz-range-track {
+    height: 3px;
+    background: var(--border-strong);
+    border-radius: 2px;
+    border: none;
+  }
+  .zoom input[type="range"]::-webkit-slider-thumb {
+    -webkit-appearance: none;
+    appearance: none;
+    width: 12px; height: 12px;
+    border-radius: 50%;
+    background: var(--text);
+    margin-top: -4.5px;
+    cursor: pointer;
+    border: none;
+  }
+  .zoom input[type="range"]::-moz-range-thumb {
+    width: 12px; height: 12px;
+    border-radius: 50%;
+    background: var(--text);
+    border: none;
+    cursor: pointer;
+  }
+  .zoom-label {
+    background: transparent;
+    border: none;
+    color: var(--text-muted);
+    font: inherit;
+    font-size: 11px;
+    line-height: 1;
+    cursor: pointer;
+    padding: 3px 4px;
+    min-width: 38px;
+    text-align: right;
+    border-radius: 3px;
+    font-variant-numeric: tabular-nums;
+  }
+  .zoom-label:hover { color: var(--text); background: var(--surface-elev); }
+
+  /* Drag-drop overlay — full-viewport hint while a file is hovering over
+     the window. pointer-events:none is critical: without it the overlay
+     intercepts the drop event and the file never reaches the drop handler. */
+  body.dragging::after {
+    content: "여기에 .hwp / .hwpx 파일을 놓으세요";
+    position: fixed;
+    inset: 0;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 16px;
+    color: var(--text);
+    background: oklch(0.18 0.004 240 / 0.82);
+    border: 2px dashed var(--border-strong);
+    z-index: 100;
+    pointer-events: none;
+  }
+</style>
+</head>
+<body>
+  <div class="toolbar">
+    <span class="info-wrap">
+      <button class="info-btn" type="button" aria-label="뷰어 정보" tabindex="0">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+             stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+          <circle cx="12" cy="12" r="10"/>
+          <line x1="12" y1="16" x2="12" y2="12"/>
+          <line x1="12" y1="8" x2="12.01" y2="8"/>
+        </svg>
+      </button>
+      <span class="info-tip" role="tooltip">
+        rhwp WebAssembly 렌더러로 표시합니다. 한컴 오피스의 픽셀 정확한 결과와
+        약간 다를 수 있어요.
+      </span>
+    </span>
+    <span class="filename" id="filename">파일을 불러오는 중…</span>
+    <div class="pagenav" id="pagenav" hidden>
+      <button id="page-prev" type="button" aria-label="이전 페이지">‹</button>
+      <input id="page-input" type="number" min="1" value="1">
+      <span class="total">/ <span id="page-total">1</span></span>
+      <button id="page-next" type="button" aria-label="다음 페이지">›</button>
+    </div>
+    <div class="zoom" id="zoom-controls" hidden>
+      <input id="zoom-slider" type="range" min="0.2" max="2" step="0.05" value="1"
+             aria-label="크기 조절">
+      <button class="zoom-label" id="zoom-label" type="button"
+              title="100%로 재설정">100%</button>
+    </div>
+    <span class="autofix-wrap">
+      <button class="autofix" id="autofix" type="button">자동 보정 ON</button>
+      <span class="autofix-tip" role="tooltip">
+        문단 줄 위치와 셀 wrap을 한컴 기준으로 다시 정렬합니다 (rhwp lineseg reflow).
+        끄면 원본 그대로 표시돼요.
+      </span>
+    </span>
+    <button class="download" id="open" type="button" title="파일 열기">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+           stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V7z"/>
+      </svg>
+    </button>
+    <input id="file-input" type="file" accept=".hwp,.hwpx" hidden>
+    <a class="download" id="download" href="#" download title="다운로드">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+           stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
+        <polyline points="7 10 12 15 17 10"/>
+        <line x1="12" y1="15" x2="12" y2="3"/>
+      </svg>
+    </a>
+  </div>
+  <main id="pages-container">
+    <div class="status" id="status">초기화 중…</div>
+  </main>
+
+  <script type="module" src="preview-viewer.js"></script>
+</body>
+</html>

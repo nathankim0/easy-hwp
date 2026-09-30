@@ -1,0 +1,11 @@
+easy-hwp consolidates the original easy-hwp HWPX workflows and the locally
+installed claw-hwp engine. Original engine code, documentation, themes, and
+vendor license files are retained in plugins/easy-hwp/skills/hwp/scripts/vendor.
+
+The binary reader/renderer uses @rhwp/core by Edward Kim. See the bundled
+vendor licenses for applicable terms. Optional kordoc and k-skill-rhwp tools
+are referenced, not redistributed; their own licenses apply when installed.
+
+Integration and layout fixes are distributed under this repository's MIT
+license. No personal documents, profiles, bot credentials, or recipients are
+included in the consolidation.

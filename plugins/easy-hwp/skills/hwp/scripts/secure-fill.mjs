@@ -1,0 +1,628 @@
+#!/usr/bin/env node
+// secure-fill.mjs — fill .hwp forms with personal info WITHOUT the values
+// entering the model's (Claude's) context. Subcommands:
+//
+//   detect                         → report env + whether a persistent profile exists (NO values)
+//   template <out.txt> --keys a,b  → write an empty, non-dev-friendly fill-in file (no values)
+//   fill --profile P --map M --out O   → fill the form (values read in-process, never printed)
+//   verify --out O --map M         → masked read-back (FILLED/EMPTY + char count only)
+//   stash --from F                 → (persistent opt-in) move F to ~/.claw-hwp/profile.txt, chmod 600.
+//                                     REFUSES in a sandbox/remote env.
+//   shred <path>                   → overwrite + delete a temp profile
+//
+// Design: Claude orchestrates by KEY NAME; this tool reads the VALUES from the
+// file in-process and pipes them to create.js stdin. create.js's STDOUT JSON
+// carries a `.log` ARRAY (not a log file) that echoes truncated cell text — we
+// parse only {status,message} and drop `.log`. No log file is written; nothing
+// here prints a value. (Cowork handoff: clarified — there is no stray .log file.)
+import { readFileSync, writeFileSync, copyFileSync, unlinkSync, existsSync, mkdirSync, chmodSync, statSync, realpathSync } from 'fs';
+import { spawnSync } from 'child_process';
+import path from 'path';
+import os from 'os';
+import { fileURLToPath } from 'url';
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const CREATE = path.join(__dirname, 'create.js');
+const HWPX_EDIT = path.join(__dirname, 'hwpx-edit.js'); // HWPX fill engine (HWPX-track slice)
+const EXTRACT = path.join(__dirname, 'extract_text.js');
+const PERSIST_DIR = path.join(process.env.CLAW_HWP_HOME || os.homedir(), '.claw-hwp');
+const PERSIST_FILE = path.join(PERSIST_DIR, 'profile.txt');
+
+// ── environment awareness ────────────────────────────────────────────────
+// In Cowork / remote sandboxes the filesystem is NOT the user's machine:
+// persisting PII there strands it on someone else's infra. Treat as sandbox
+// unless local desktop ownership is positively proven. A prompt/file injection
+// can ask the agent to set CLAW_HWP_ENV=local, so that override is advisory only.
+function envInfo() {
+  const forced = process.env.CLAW_HWP_ENV || null; // 'sandbox' | 'local'
+  const platform = process.platform, arch = process.arch;
+  const home = os.homedir();
+  // FAIL-CLOSED: treat as sandbox unless LOCAL is positively proven.
+  // (Cowork handoff C2: arch-only guessing is fail-open; a wrong guess lets
+  //  stash persist plaintext PII onto Anthropic infra.)
+  const homeLooksSandbox = home.startsWith('/sessions') || home.startsWith('/tmp') || home === '/' || home === '/root';
+  const homeLooksLocalDesktop =
+    (platform === 'darwin' && home.startsWith('/Users/')) ||
+    (platform === 'win32' && /^[A-Za-z]:[\\/]Users[\\/]/.test(home));
+  let likely_sandbox;
+  let forced_ignored = null;
+  if (forced === 'sandbox') likely_sandbox = true;
+  else if (forced === 'local' && homeLooksLocalDesktop && !homeLooksSandbox) likely_sandbox = false;
+  else if (forced === 'local') {
+    likely_sandbox = true;
+    forced_ignored = 'CLAW_HWP_ENV=local ignored because this home is not a proven local desktop home';
+  } else if (homeLooksSandbox) likely_sandbox = true;
+  else if (homeLooksLocalDesktop) likely_sandbox = false;
+  else likely_sandbox = true; // unknown (e.g. bare linux) → fail closed to sandbox
+  return { platform, arch, home, forced, forced_ignored, likely_sandbox, local_proven: !likely_sandbox };
+}
+
+// ── profile loading (txt "키: 값"  OR  json) ──────────────────────────────
+function loadProfile(p) {
+  const raw = readFileSync(p, 'utf8');
+  if (p.toLowerCase().endsWith('.json')) return JSON.parse(raw);
+  const obj = {};
+  for (const line of raw.split(/\r?\n/)) {
+    const t = line.trim();
+    if (!t || t.startsWith('#')) continue;
+    const i = t.indexOf(':');
+    if (i < 0) continue;
+    const k = t.slice(0, i).trim();
+    const v = t.slice(i + 1).trim();
+    if (k) obj[k] = v; // keep empty values so `keys` can list all fields; fill treats '' as not-yet-filled
+  }
+  return obj;
+}
+
+// ── value formatting ──────────────────────────────────────────────────────
+// One canonical value in the profile, many on-form shapes. A mapping field can
+// carry `format` (e.g. "date:yy.mm.dd", "phone:intl-paren", "rrn:digits"); the
+// transform runs HERE, so neither the value nor the reshaped value ever enters
+// Claude's context — Claude only writes the format NAME in the mapping.
+function parseYMD(v) {
+  const d = String(v).replace(/\D/g, '');
+  let y, m, day;
+  if (d.length >= 8) { y = d.slice(0, 4); m = d.slice(4, 6); day = d.slice(6, 8); }
+  else if (d.length === 6) { const yy = +d.slice(0, 2); y = String(yy <= 29 ? 2000 + yy : 1900 + yy); m = d.slice(2, 4); day = d.slice(4, 6); }
+  else return null;
+  return { y, yy: y.slice(2), m, d: day };
+}
+function fmtDate(v, style) {
+  const p = parseYMD(v); if (!p) return v;
+  // token replace, longest-first: yyyy/yy/mm/dd then single m/d (no leading zero)
+  return (style || 'yyyy-mm-dd')
+    .replace(/yyyy/g, p.y).replace(/yy/g, p.yy)
+    .replace(/mm/g, p.m).replace(/dd/g, p.d)
+    .replace(/m/g, String(+p.m)).replace(/d/g, String(+p.d));
+}
+// digit mask: each `#` consumes the next digit of the value, literals pass through.
+function maskDigits(v, pattern) {
+  const ds = String(v).replace(/\D/g, ''); let i = 0;
+  return String(pattern).replace(/#/g, () => ds[i++] ?? '');
+}
+function fmtPhone(v, style) {
+  const d = String(v).replace(/\D/g, ''); if (d.length < 9) return v;
+  const a = d.slice(0, 3), b = d.slice(3, -4), c = d.slice(-4);
+  switch (style) {
+    case 'digits': return d;
+    case 'dot': return `${a}.${b}.${c}`;
+    case 'space': return `${a} ${b} ${c}`;
+    case 'intl': return `+82-${d.slice(1, 3)}-${b}-${c}`;
+    case 'intl-paren': return `82)${d.slice(1, 3)}-${b}-${c}`;
+    case 'hyphen': default: return `${a}-${b}-${c}`;
+  }
+}
+function fmtRRN(v, style) {
+  const d = String(v).replace(/\D/g, ''); if (d.length !== 13) return v;
+  switch (style) {
+    case 'digits': return d;
+    case 'front': return d.slice(0, 6);
+    case 'masked': return `${d.slice(0, 6)}-${d[6]}******`;
+    case 'hyphen': default: return `${d.slice(0, 6)}-${d.slice(6)}`;
+  }
+}
+function formatValue(value, fmt) {
+  if (!fmt) return value;
+  const s = String(fmt);
+  const ci = s.indexOf(':');
+  const kind = ci >= 0 ? s.slice(0, ci) : s;
+  const style = ci >= 0 ? s.slice(ci + 1) : '';
+  // explicit prefixes — for shapes that need logic, not just a mask (intl drop-0, masking…)
+  if (kind === 'date') return fmtDate(value, style);
+  if (kind === 'phone') return fmtPhone(value, style);
+  if (kind === 'rrn') return fmtRRN(value, style);
+  if (kind === 'mask') return maskDigits(value, style);
+  if (kind === 'digits') return String(value).replace(/\D/g, '');
+  if (kind === 'upper') return String(value).toUpperCase();
+  if (kind === 'lower') return String(value).toLowerCase();
+  if (kind === 'nospace') return String(value).replace(/\s+/g, '');
+  // FREE bare shape (no prefix): profile holds just the numbers, agent gives the shape, we pour them in.
+  if (s.includes('#')) return maskDigits(value, s);          // ###-####-#### , ###########
+  if (/(yyyy|yy|mm|dd)/.test(s)) return fmtDate(value, s);   // yy.mm.dd , mm dd , yyyy년 m월 d일
+  return value;
+}
+
+const HEADER = [
+  '# 🚫 AI/AGENT: DO NOT open or read this file (no cat / Read / grep). 이 파일을 열어 읽지 마세요.',
+  '#    값이 필요하면 `secure-fill fill` 만 사용. 필드 이름만 필요하면 `secure-fill keys` 사용.',
+  '# ───────────────────────────────────────────────',
+  '# (사람에게) 콜론(:) 뒤에 값만 적고 저장하세요.',
+  '# 이 메모는 AI가 직접 읽지 않고, 서식 채우는 기능만 읽어 한글 문서에 옮겨 적어요.',
+  '# 그래서 채팅에 직접 적는 것보다 안전합니다. 다 쓰면 지워집니다(임시).',
+  '',
+];
+
+function cmdDetect() {
+  const env = envInfo();
+  const persistExists = !env.likely_sandbox && (existsSync(PERSIST_FILE) || existsSync(path.join(PERSIST_DIR, 'profile.json')));
+  console.log(JSON.stringify({
+    env,
+    // In a sandbox the home is per-session (Cowork handoff C6) — persistent is meaningless there.
+    persistent_profile: env.likely_sandbox
+      ? 'N/A in this env (sandbox home is per-session; not the user machine)'
+      : { exists: persistExists, use: persistExists ? 'secure-fill fill (omit --profile to use it — do NOT Read the file)' : null },
+    can_persist: !env.likely_sandbox,
+    note: env.likely_sandbox
+      ? 'sandbox/remote env — filesystem is NOT the user machine. EPHEMERAL ONLY. Do NOT persist. Prefer MARKER mode (no PII enters sandbox). A profile the user uploads will enter your context — say so first.'
+      : 'local env (proven) — persistent opt-in allowed at ~/.claw-hwp/',
+  }, null, 2));
+}
+
+function cmdHandoff(args) {
+  // Cowork → local Claude Code routing note. Contains NO PII.
+  const keys = args.keys ? String(args.keys).split(',').map((s) => s.trim()).filter(Boolean) : [];
+  const lines = [
+    '# 개인정보 서식 채우기 — 로컬 Claude Code에서 이어서 해주세요',
+    '',
+    '이 작업엔 **개인정보**가 들어갑니다. 지금 환경(Cowork)은 원격이라 개인정보를 안전하게 두기 어려워요.',
+    '아래를 **로컬 Claude Code**(내 컴퓨터에서 도는 앱)에 그대로 전달해 주세요. 거기선 정보가 컴퓨터 밖으로 나가지 않습니다.',
+    '',
+    '## Claude Code에 이렇게 말하세요',
+    '- 서식: 이 노트와 함께 받은 원본 서식 파일',
+    keys.length ? `- 채울 항목: ${keys.join(', ')}` : '- 채울 항목: 서식의 빈칸들',
+    '- 요청: "이 서식을 secure-fill로 내 개인정보를 채워줘. 값은 내가 파일에 직접 적을게."',
+    '',
+    '## 또는 — 지금 여기서 끝내려면 (마커 방식)',
+    '빈칸에 「여기에 OOO 입력」 표식만 넣은 양식을 드릴 테니, 한컴오피스/한컴독스에서 직접 채우셔도 됩니다.',
+    '그러면 개인정보가 이 원격 환경에 전혀 들어오지 않습니다.',
+  ];
+  writeFileSync(args.out, lines.join('\n') + '\n');
+  console.log(JSON.stringify({ wrote: args.out, form: 'redacted', keys, contains_pii: false }, null, 2));
+}
+
+function refuse(reason) {
+  console.log(JSON.stringify({ error: 'REFUSED', reason }, null, 2));
+  process.exit(3);
+}
+
+// Restrict profile/keys input to known-safe roots so the tool can't be turned
+// into an arbitrary-file reader (Cowork handoff V6). Legit profiles live in the
+// persist dir / temp / cwd / Desktop / Downloads.
+function assertProfileInput(p, label) {
+  // realpath-normalize both sides so symlinks (e.g. /tmp → /private/tmp on macOS)
+  // and `..` collapse — blocks /etc/passwd-style reads without breaking legit
+  // profile locations under home / cwd / temp / ~/.claw-hwp.
+  const norm = (x) => { try { return realpathSync(x); } catch { return path.resolve(x); } };
+  const abs = norm(p);
+  const roots = [process.cwd(), os.tmpdir(), '/tmp', os.homedir(), PERSIST_DIR].map(norm);
+  if (!roots.some((r) => abs === r || abs.startsWith(r + path.sep))) refuse(`${label} path outside allowed locations (cwd / home / temp / ~/.claw-hwp)`);
+  return abs;
+}
+
+function cmdKeys(p) {
+  assertProfileInput(p, 'profile');
+  const prof = loadProfile(p); // values loaded in-process but NOT printed
+  console.log(JSON.stringify({ keys: Object.keys(prof), note: 'field names only — values were NOT read out' }, null, 2));
+}
+
+function cmdTemplate(out, keys) {
+  const lines = [...HEADER, ...keys.map((k) => `${k}: `), ''];
+  writeFileSync(out, lines.join('\n'));
+  try { chmodSync(out, 0o600); } catch {}
+  console.log(JSON.stringify({ wrote: out, keys, values: 'none (empty template)' }, null, 2));
+}
+
+function cmdFill(args, preset = null) {
+  // `fill --auto` builds the mapping itself (profile keys → form labels) so the agent
+  // never authors mapping.json; it delegates back here with a `preset` mapping object.
+  if (args.auto && !preset) return cmdFillAuto(args);
+  // Default to the saved profile so Claude never needs to handle the PII path at all.
+  const profilePath = args.profile || PERSIST_FILE, mapPath = args.map, out = args.out;
+  // The SECURITY model (boundary/ephemeral/format/env/injection) is format-agnostic
+  // and runs HERE for both engines; only the fill ENGINE branches below.
+  assertProfileInput(profilePath, 'profile');
+  const profile = loadProfile(profilePath);            // values — never printed
+  const mapping = preset || JSON.parse(readFileSync(mapPath, 'utf8'));
+  // V1/V2 (Cowork handoff): mapping.template must be an EXISTING .hwp/.hwpx that
+  // sits beside the mapping — never a traversal/absolute path, else an untrusted
+  // "form pack" could copy an arbitrary file (e.g. ~/.ssh/id_rsa) into the
+  // user-delivered output. A `preset` mapping comes from --auto with a user-supplied
+  // --form (trusted like --profile), so it resolves the template directly.
+  let template;
+  if (preset) {
+    template = path.resolve(mapping.template || '');
+    if (!/\.hwpx?$/i.test(template) || !existsSync(template)) refuse(`--form must be an existing .hwp/.hwpx (got '${mapping.template}')`);
+  } else {
+    const baseDir = path.resolve(path.dirname(mapPath));
+    template = path.resolve(baseDir, mapping.template || '');
+    const rel = path.relative(baseDir, template);
+    if (rel.startsWith('..') || path.isAbsolute(rel)) refuse(`mapping.template escapes the mapping folder (got '${mapping.template}')`);
+    if (!/\.hwpx?$/i.test(template) || !existsSync(template)) refuse(`mapping.template must be an existing .hwp/.hwpx beside the mapping (got '${mapping.template}')`);
+  }
+
+  const attempted = [];
+  const missing = [];
+
+  // ── HWPX engine (HWPX-track slice): hwpx-edit.js ─────────────────────────
+  // Values stay out of the model exactly like the .hwp path: built in-tool,
+  // piped to hwpx-edit.js stdin, and only counts (never values) come back.
+  // Two field styles: `placeholder` → fill_template (control/run-aware replace,
+  // so a blank split by <hp:fwSpace/>/runs still fills); `table`+`row`+`col` →
+  // set_cell_text (positional). label+offset is .hwp-only (no by-label in HWPX).
+  if (path.extname(String(out)).toLowerCase() === '.hwpx') {
+    const values = {};
+    const operations = [];
+    for (const f of mapping.fields) {
+      const name = f.placeholder ?? (f.table != null ? `cell[${f.table},${f.row},${f.col}]` : (f.label ?? f.key));
+      const raw = profile[f.key];
+      if (raw == null || raw === '') { missing.push(f.key); attempted.push({ field: name, key: f.key, status: 'EMPTY_KEY' }); continue; }
+      const val = formatValue(String(raw), f.format); // reshape in-tool (date/phone/rrn/…)
+      if (f.placeholder != null) values[f.placeholder] = val;
+      else if (f.table != null && f.row != null && f.col != null) operations.push({ type: 'set_cell_text', table: f.table, row: f.row, col: f.col, text: val, fit: f.fit ?? true });
+      else refuse(`.hwpx field '${f.key}' needs 'placeholder' OR 'table'+'row'+'col' (label+offset is .hwp-only)`);
+      attempted.push({ field: name, key: f.key, chars: val.length, ...(f.format ? { format: f.format } : {}) });
+    }
+    // require_unique: PII safety — a placeholder that matches >1 spot (multi-person / parallel
+    // form) would fill several people's blocks with the same value. Refuse so the agent
+    // retargets with {table,row,col}. Mirrors the .hwp branch's require_occurrence guard.
+    if (Object.keys(values).length) operations.unshift({ type: 'fill_template', values, require_unique: true });
+    const res = spawnSync('node', [HWPX_EDIT], { input: JSON.stringify({ path: template, output: out, operations }), encoding: 'utf8', maxBuffer: 1 << 26 });
+    let ok = false, message = null;
+    try { const o = JSON.parse(res.stdout) || {}; ok = o.ok === true; message = o.error ?? null; } catch {}
+    console.log(JSON.stringify({
+      out, engine: 'hwpx-edit.js', engine_ok: ok,
+      ...(ok ? { filled: attempted } : { engine_message: message, attempted: attempted.map((a) => a.field) }),
+      missing_keys: missing,
+      note: 'values never printed; hwpx-edit stdout result body (counts only) dropped',
+    }, null, 2));
+    if (!ok) process.exit(2);
+    return;
+  }
+
+  // ── HWP engine: create.js raw-patch (set_cell_text_by_label) ─────────────
+  copyFileSync(template, out);
+  const operations = [];
+  // Position-based fields address a cell the same way the .hwpx branch does — by
+  // {table,row,col} (or native {section,para,control,row,col}). A `table` index is
+  // resolved once to the .hwp (section,para,control) triple via --inspect. This gives
+  // the .hwp branch the same targeting the engine's set_cell_text has, so duplicate-label
+  // forms (참여인력 5명 블록, 비영리/기업 병렬표) don't have to go through label matching
+  // at all — no 변환 needed.
+  const needsTableMap = mapping.fields.some((f) => f.table != null && f.row != null && f.col != null);
+  let tableMap = null;
+  if (needsTableMap) {
+    tableMap = inspectTables(out).map((t) => ({ section: t.sec ?? 0, para: t.para, control: t.ctrl }));
+  }
+  for (const f of mapping.fields) {
+    const name = f.label ?? (f.table != null ? `cell[t${f.table},${f.row},${f.col}]` : `cell[${f.para},${f.control},${f.row},${f.col}]`);
+    const raw = profile[f.key];
+    if (raw == null || raw === '') { missing.push(f.key); attempted.push({ field: name, key: f.key, status: 'EMPTY_KEY' }); continue; }
+    const val = formatValue(String(raw), f.format); // reshape per-field (date/phone/rrn/…), in-tool
+    if (f.label == null && f.row != null && f.col != null) {
+      // ── position-based (no label) — exact cell, no ambiguity ──
+      let addr = null;
+      if (f.para != null && f.control != null) addr = { section: f.section ?? 0, para: f.para, control: f.control };
+      else if (f.table != null && tableMap && tableMap[f.table] != null) addr = tableMap[f.table];
+      else { refuse(`.hwp positional field '${f.key}' needs a 'table' index (or 'para'+'control')`); }
+      operations.push({ type: 'set_cell_text', ...addr, row: f.row, col: f.col, text: val, fit: f.fit ?? true, ...(f.cell_para != null ? { cell_para: f.cell_para } : {}) });
+    } else if (f.label != null) {
+      // ── label-based — pass through the engine's full targeting (occurrence / table scope /
+      //    case / cell_para / append). require_occurrence makes an ambiguous multi-match REFUSE
+      //    instead of silently overwriting the first block (e.g. the 대표이사 row). ──
+      operations.push({
+        type: 'set_cell_text_by_label', label: f.label, text: val,
+        // Do NOT default the offsets to 0 — the engine reads a *missing* col_offset as
+        // "the cell after the label (colSpan-aware)", but col_offset:0 as "overwrite the
+        // label cell itself". Forcing 0 clobbered the label instead of filling the value
+        // cell. Pass offsets through only when the mapping actually sets them.
+        ...(f.col_offset != null ? { col_offset: f.col_offset } : {}),
+        ...(f.row_offset != null ? { row_offset: f.row_offset } : {}),
+        fit: f.fit ?? true, // 길이보존(에이전트가 PII 값을 못 세므로 in-tool 자동); no-op when no padding run
+        require_occurrence: true,
+        ...(f.occurrence != null ? { occurrence: f.occurrence } : {}),
+        ...(f.section != null ? { section: f.section, para: f.para, control: f.control } : {}),
+        ...(f.case_sensitive ? { case_sensitive: true } : {}),
+        ...(f.cell_para != null ? { cell_para: f.cell_para } : {}),
+        ...(f.append ? { append: true } : {}),
+      });
+    } else { refuse(`.hwp field '${f.key}' needs 'label' (with optional occurrence/section/para/control) or 'row'+'col' (with 'table' or 'para'+'control')`); }
+    attempted.push({ field: name, key: f.key, chars: val.length, ...(f.format ? { format: f.format } : {}) });
+  }
+  const res = spawnSync('node', [CREATE], { input: JSON.stringify({ path: out, operations }), encoding: 'utf8', maxBuffer: 1 << 26 });
+  let status = 'parse_error', message = null;
+  try { const o = JSON.parse(res.stdout) || {}; status = o.status ?? 'unknown'; message = o.message ?? null; } catch {}
+  const ok = status === 'ok' || status === 'success';
+  console.log(JSON.stringify({
+    out, engine_status: status,
+    ...(ok ? { filled: attempted } : { engine_message: message, attempted: attempted.map((a) => a.field) }),
+    missing_keys: missing,
+    note: 'values never printed; create.js stdout .log array (not a file) dropped',
+  }, null, 2));
+  if (!ok) process.exit(2);
+}
+
+// ── `fill --auto` (.hwp): match profile keys to the blank form's labels, no mapping.json ──
+// The agent runs ONE command instead of inspect + hand-authoring a mapping. Ambiguity is
+// REFUSED, never guessed: a key matching 0 or >1 label cells is reported unmatched, not filled
+// (mirrors the engine's require_occurrence guard). Values stay in-tool exactly like `fill`.
+function normLabel(s) {
+  // Match a profile key to a form label tolerantly: trim, drop a trailing colon, collapse
+  // internal whitespace, lowercase. Keeps word boundaries so distinct labels don't collide.
+  return String(s).trim().replace(/[:：]\s*$/, '').replace(/\s+/g, ' ').toLowerCase();
+}
+function inferFormat(key) {
+  const k = String(key);
+  // Only shapes whose reformat is IDEMPOTENT on an already-formatted value (safe whether the
+  // profile holds digits-only or a hyphenated value). Dates/accounts are left raw — the form's
+  // target shape is unknown, so re-formatting could mangle; author a --map field for those.
+  if (/주민\s*(등록)?\s*번호/.test(k)) return 'rrn:hyphen';
+  if (/(휴대폰|핸드폰|전화|연락처|mobile|phone|tel)/i.test(k)) return 'phone:hyphen';
+  return null;
+}
+function cmdFillAuto(args) {
+  const form = args.form, out = args.out;
+  const profilePath = args.profile || PERSIST_FILE;
+  if (!form) refuse('fill --auto needs --form <빈 서식 .hwp/.hwpx>');
+  if (!out) refuse('fill --auto needs --out <결과 파일>');
+  assertProfileInput(profilePath, 'profile');
+  const formAbs = path.resolve(form);
+  if (!/\.hwpx?$/i.test(formAbs) || !existsSync(formAbs)) refuse(`--form must be an existing .hwp/.hwpx (got '${form}')`);
+  // HWPX-track slice: .hwpx fill has no by-label targeting, so --auto resolves each matched
+  // label to the POSITION of its value cell and delegates to the {table,row,col} path.
+  if (path.extname(formAbs).toLowerCase() === '.hwpx') return fillAutoHwpx(args, formAbs, profilePath);
+  const profile = loadProfile(profilePath);            // values in-tool, never printed
+  const keys = Object.keys(profile).filter((k) => profile[k] != null && String(profile[k]).trim() !== '');
+  // Collect the form's text-bearing (label) cells from --inspect.
+  const labels = [];
+  for (const t of inspectTables(formAbs)) for (const c of (t.cells || [])) {
+    const txt = (c.text || '').trim();
+    if (txt) labels.push({ orig: txt, norm: normLabel(txt) });
+  }
+  const fields = [], unmatched = [], ambiguous = [];
+  for (const key of keys) {
+    const nk = normLabel(key);
+    const hits = labels.filter((l) => l.norm === nk);
+    if (hits.length === 1) { const fmt = inferFormat(key); fields.push({ key, label: hits[0].orig, ...(fmt ? { format: fmt } : {}) }); }
+    else if (hits.length === 0) unmatched.push(key);
+    else ambiguous.push(key); // duplicate label — don't guess which block; caller retargets with --map {table,row,col}
+  }
+  // Report the MATCH PLAN (label/key names only — never values) so the agent sees what will fill.
+  console.log(JSON.stringify({
+    auto: true, form: path.basename(formAbs),
+    matched: fields.map((f) => f.label), unmatched, ambiguous,
+    note: ambiguous.length
+      ? 'ambiguous keys matched >1 label — NOT filled; target them via `fill --map` {table,row,col}'
+      : 'matched keys fill the cell after each label; values never printed',
+  }, null, 2));
+  if (!fields.length) refuse('fill --auto matched no fields — profile keys must equal form labels, or use `fill --map`');
+  // Reuse the proven .hwp fill path with an in-memory preset mapping (no mapping.json on disk).
+  cmdFill(args, { template: formAbs, fields });
+}
+
+// ── `fill --auto` (.hwpx): HWPX-track slice ──────────────────────────────────
+// .hwpx fill has NO by-label targeting (label+offset is .hwp-only), so --auto can't hand a
+// label straight to the engine like the .hwp path does. Instead it enumerates the form's cells
+// (via hwpx-edit's read-only `inspect: 'cells'`, which uses the SAME colAddr addressing
+// set_cell_text resolves) and converts each 1:1-matched label into the POSITION of its value
+// cell — the empty cell immediately to the right (colSpan-aware). Then it delegates to cmdFill's
+// {table,row,col} path. Ambiguity is REFUSED, never guessed, exactly like the .hwp branch:
+//   • key matches 0 labels                    → unmatched
+//   • key matches >1 labels                    → ambiguous (multi-person/parallel form — use --map)
+//   • matched label has no empty right cell    → unmatched (header-on-top / value-below forms; use --map)
+// Values stay in-tool; only label text + cell coordinates (never PII) are ever printed.
+function fillAutoHwpx(args, formAbs, profilePath) {
+  if (path.extname(String(args.out)).toLowerCase() !== '.hwpx') refuse('a .hwpx --form needs a .hwpx --out');
+  const profile = loadProfile(profilePath);            // values in-tool, never printed
+  const keys = Object.keys(profile).filter((k) => profile[k] != null && String(profile[k]).trim() !== '');
+  // Read the form's cell inventory {table,row,col,text} (no mutation, no save).
+  const res = spawnSync('node', [HWPX_EDIT], { input: JSON.stringify({ path: formAbs, inspect: 'cells' }), encoding: 'utf8', maxBuffer: 1 << 26 });
+  let tables = null;
+  try { const o = JSON.parse(res.stdout) || {}; if (o.ok) tables = o.tables; } catch {}
+  if (!tables) refuse('fill --auto could not inspect the .hwpx form (hwpx-edit inspect failed)');
+  // For each text-bearing (label) cell, precompute its value cell = same row, the cell after the
+  // label (colSpan-aware), and whether that cell exists and is empty.
+  const labels = [];
+  for (const t of tables) {
+    const byRC = new Map();                            // "row,col" → cell
+    for (const c of t.cells) byRC.set(`${c.row},${c.col}`, c);
+    for (const c of t.cells) {
+      const txt = (c.text || '').trim();
+      if (!txt) continue;
+      const valueCol = c.col + (c.colSpan || 1);
+      const vcell = byRC.get(`${c.row},${valueCol}`);
+      labels.push({
+        orig: txt, norm: normLabel(txt), table: t.index, row: c.row, valueCol,
+        valueExists: !!vcell, valueEmpty: vcell ? (vcell.text || '').trim() === '' : false,
+      });
+    }
+  }
+  const fields = [], unmatched = [], ambiguous = [];
+  for (const key of keys) {
+    const nk = normLabel(key);
+    const hits = labels.filter((l) => l.norm === nk);
+    if (hits.length === 1) {
+      const h = hits[0];
+      if (!h.valueExists || !h.valueEmpty) { unmatched.push(key); continue; } // no empty right cell → don't guess/clobber
+      const fmt = inferFormat(key);
+      fields.push({ key, label: h.orig, table: h.table, row: h.row, col: h.valueCol, ...(fmt ? { format: fmt } : {}) });
+    } else if (hits.length === 0) unmatched.push(key);
+    else ambiguous.push(key); // duplicate label — don't guess which block; caller retargets with --map {table,row,col}
+  }
+  // Report the MATCH PLAN (label/coordinate names only — never values) so the agent sees what will fill.
+  console.log(JSON.stringify({
+    auto: true, form: path.basename(formAbs), engine: 'hwpx',
+    matched: fields.map((f) => f.label), unmatched, ambiguous,
+    note: ambiguous.length
+      ? 'ambiguous keys matched >1 label — NOT filled; target them via `fill --map` {table,row,col}'
+      : 'matched keys fill the empty cell right of each label; values never printed',
+  }, null, 2));
+  if (!fields.length) refuse('fill --auto matched no fillable fields — a profile key must equal a form label that has an empty cell to its right, or use `fill --map`');
+  // Delegate to the .hwpx fill engine via an in-memory positional preset (no mapping.json on disk).
+  cmdFill(args, { template: formAbs, fields });
+}
+
+// The big-form truncation (async process.stdout.write + process.exit) is fixed in
+// extract_text via synchronous writeOut, but rhwp's getCellInfo sweep is itself
+// non-deterministic and can still return an unusable dump on a bad run — one JSON.parse
+// then throws and secure-fill dies. Retry a few times (a re-run almost always succeeds)
+// so cell targeting / verify parse reliably.
+function inspectTables(file, tries = 4) {
+  let last = '';
+  for (let i = 0; i < tries; i++) {
+    const r = spawnSync('node', [EXTRACT, '--inspect', '--with-cell-text', file], { encoding: 'utf8', maxBuffer: 1 << 26 });
+    last = r.stderr || '';
+    try { const root = JSON.parse(r.stdout); return Array.isArray(root) ? root : (root.tables || []); }
+    catch { /* truncated/invalid this run — retry */ }
+  }
+  throw new Error(`extract_text --inspect returned invalid JSON after ${tries} tries (rhwp sweep flake)${last ? ': ' + last.slice(0, 120) : ''}`);
+}
+
+function cmdVerify(args) {
+  const mapping = JSON.parse(readFileSync(args.map, 'utf8'));
+  // ── HWPX verify (HWPX-track slice) ───────────────────────────────────────
+  // --with-cell-text is .hwp-only (rhwp getCellInfo sweep), so for .hwpx we read
+  // the rendered text once and report masked FILLED/EMPTY: a `placeholder` field
+  // is FILLED when its blank text is gone; a positional field is checked by the
+  // value never being shown (only presence). Values stay masked.
+  if (path.extname(String(args.out)).toLowerCase() === '.hwpx') {
+    const res = spawnSync('node', [EXTRACT, '--format', 'markdown', args.out], { encoding: 'utf8', maxBuffer: 1 << 26 });
+    const text = res.stdout || '';
+    const verified = mapping.fields.map((f) => {
+      if (f.placeholder != null) return { field: f.placeholder, status: text.includes(f.placeholder) ? 'EMPTY' : 'FILLED' };
+      return { field: `cell[${f.table},${f.row},${f.col}]`, status: 'POSITIONAL', note: 'positional cell — open in 한컴 to confirm' };
+    });
+    console.log(JSON.stringify({ verified, note: 'values masked; .hwpx placeholder presence check' }, null, 2));
+    return;
+  }
+  const tables = inspectTables(args.out);                          // retry-hardened (rhwp sweep can flake)
+  const norm = (x) => (x || '').replace(/[\s　]+/g, '');            // whitespace-insensitive, like the engine's label match
+  const labelHits = (s) => { const hits = [], n = norm(s); for (const t of tables) for (const c of t.cells) if (norm(c.text).includes(n)) hits.push({ t, c }); return hits; };
+  const cellAt = (t, r, c2) => (t ? t.cells.find((c) => c.row === r && c.col === c2) : null) || null;
+  const verified = [];
+  for (const f of mapping.fields) {
+    const name = f.label ?? (f.table != null ? `cell[t${f.table},${f.row},${f.col}]` : `cell[${f.para},${f.control},${f.row},${f.col}]`);
+    let cell = null;
+    if (f.label == null && f.row != null && f.col != null) {
+      // positional — resolve the exact table the fill used (table index OR para+control)
+      const t = f.table != null ? tables[f.table] : tables.find((tb) => tb.para === f.para && tb.ctrl === f.control);
+      cell = cellAt(t, f.row, f.col);
+    } else if (f.label != null) {
+      const hit = labelHits(f.label)[f.occurrence ?? 0];             // the SAME occurrence-th match the fill wrote to
+      if (!hit) { verified.push({ field: name, status: 'LABEL_NOT_FOUND' }); continue; }
+      const dCol = f.col_offset ?? (f.append ? 0 : (hit.c.colSpan ?? 1)); // fill's default = the cell after the label (colSpan-aware)
+      cell = cellAt(hit.t, hit.c.row + (f.row_offset ?? 0), hit.c.col + dCol); // stay WITHIN the matched label's table
+    }
+    const txt = cell ? (cell.text || '') : '';
+    verified.push({ field: name, status: txt.length ? 'FILLED' : 'EMPTY', chars: txt.length, masked: '•'.repeat(Math.min(txt.length, 16)) });
+  }
+  console.log(JSON.stringify({ verified, note: 'values masked' }, null, 2));
+}
+
+function cmdStash(args) {
+  const env = envInfo();
+  if (env.likely_sandbox) {
+    console.log(JSON.stringify({ error: 'REFUSED', reason: 'sandbox/remote env — cannot persist PII to a machine that is not the user\'s. Deliver the file back to the user instead.' }, null, 2));
+    process.exit(3);
+  }
+  if (!existsSync(PERSIST_DIR)) mkdirSync(PERSIST_DIR, { recursive: true });
+  copyFileSync(args.from, PERSIST_FILE);
+  try { chmodSync(PERSIST_FILE, 0o600); } catch {}
+  try { unlinkSync(args.from); } catch {}
+  console.log(JSON.stringify({ stashed: PERSIST_FILE, perms: '600', source_removed: args.from, warning: '평문 PII. 중고판매·동기화 주의. 삭제하려면 secure-fill shred 사용.' }, null, 2));
+}
+
+function cmdShred(p) {
+  try {
+    const sz = statSync(p).size;
+    writeFileSync(p, Buffer.alloc(sz, 0)); // overwrite once
+  } catch {}
+  try { unlinkSync(p); } catch {}
+  console.log(JSON.stringify({ shredded: p }, null, 2));
+}
+
+// ── arg parse ──────────────────────────────────────────────────────────
+function flags(argv) {
+  const o = {};
+  for (let i = 0; i < argv.length; i++) {
+    if (argv[i].startsWith('--')) { o[argv[i].slice(2)] = (argv[i + 1] && !argv[i + 1].startsWith('--')) ? argv[++i] : true; }
+  }
+  return o;
+}
+
+const HELP = `secure-fill.mjs — .hwp/.hwpx 서식을 개인정보 값이 Claude 컨텍스트에 유입되지 않게 채운다.
+값은 이 도구가 프로필 파일에서 직접 읽어 셀에만 쓰고, 에이전트에는 개수/마스킹만 반환한다.
+⚠️ 프로필/채운 값을 직접 cat/Read/grep 하지 말 것 — keys/verify 만 써라 (값은 절대 컨텍스트에 안 들어옴).
+   이 도움말이면 충분하다 — 소스(secure-fill.mjs)를 통째로 읽지 마라.
+
+subcommands:
+  detect                                     환경 + 영구 프로필 존재 여부 (값 없음)
+  keys <profile.txt>                         프로필의 필드명만 나열 (값 안 읽음)
+  template <out.txt> --keys a,b              빈 채움 템플릿(.txt) 생성 (값 없음)
+  fill  --profile <txt> --map <map.json> --out <결과.hwp|.hwpx>
+                                             서식 채우기. --profile 생략 시 저장된 영구 프로필 사용.
+  fill --auto --profile <txt> --form <빈서식.hwp|.hwpx> --out <결과.hwp|.hwpx>   ★ 가장 간단
+                                             프로필 키를 서식 라벨에 자동 매칭 → mapping.json 불필요 (.hwp·.hwpx 공통).
+                                             애매(0/2+ 매칭)한 키는 안 채우고 unmatched 로 보고.
+  verify --out <채운파일> --map <map.json>    채운 값 검증 (마스킹 출력)
+  stash <profile.txt> / shred <profile.txt>  영구 프로필 저장(~/.claw-hwp) / 안전 삭제
+  handoff --form <서식> --out <노트.md>       업로드 환경용 PII-free 인수인계 노트
+
+fill 워크플로:
+  ★ 한 줄로 끝 — node secure-fill.mjs fill --auto --profile "<txt>" --form "<빈서식.hwp|.hwpx>" --out "<결과.hwp|.hwpx>"
+     (.hwp·.hwpx 둘 다. 라벨 자동매칭. 매칭이 애매하다고 나오면 아래 --map 5스텝으로.)
+
+  --map 수동 (5스텝):
+  1) node secure-fill.mjs keys "<profile.txt>"                          # 필드명 확인 (값 안 봄)
+  2) node extract_text.js "<빈서식>" --inspect --with-cell-text        # 셀 {table,row,col} 구조 확인
+  3) map.json 작성 (아래 예시)
+  4) node secure-fill.mjs fill --profile "<txt>" --map "<map.json>" --out "<결과.hwp>"
+  5) node secure-fill.mjs verify --out "<결과.hwp>" --map "<map.json>"  # 마스킹 검증
+
+map.json 형식:
+{
+  "template": "강사소개서(서식).hwp",     // map.json 과 같은 폴더의 기존 서식 (상대경로만, 절대/상위경로 금지)
+  "fields": [
+    { "key": "성명", "label": "성명" },                                 // .hwp 라벨 기반: 라벨 셀의 옆칸을 채움
+    { "key": "주민등록번호", "label": "주민등록번호", "format": "######-#######" },
+    { "key": "휴대폰", "label": "휴대폰", "format": "###-####-####" },
+    { "key": "생년월일", "label": "생년월일", "format": "yyyy.mm.dd" }
+  ]
+  // 위치 기반(.hwp/.hwpx 공통): { "key":"주소", "table":0, "row":4, "col":1, "format":"..." }
+  // .hwpx placeholder:          { "key":"성명", "placeholder":"(    )", "format":"..." }
+  // 중복 라벨(다인/병렬 폼): 라벨에 "occurrence":0(문서순) 추가하거나 위치 기반 {table,row,col} 로 지목
+}
+
+format 토큰:  # = 숫자 한 자리  (예 ###-####-####, ######-#######).  날짜 = yyyy/yy/mm/dd/m/d 조합.
+  프리셋:  rrn:masked · phone:intl · phone:intl-paren.
+  프로필 값엔 숫자만 넣어라 (전화 01012345678, 생일 900101) — 모양 변환은 format 이 처리.`;
+
+const [cmd, ...rest] = process.argv.slice(2);
+// Help must never fall through to a subcommand — `keys --help` etc. used to hit
+// loadProfile('--help') → ENOENT. Intercept BEFORE dispatch so any --help/-h prints usage.
+if (!cmd || cmd === '--help' || cmd === '-h' || cmd === 'help' || rest.includes('--help') || rest.includes('-h')) {
+  console.log(HELP);
+  process.exit(0);
+}
+switch (cmd) {
+  case 'detect': cmdDetect(); break;
+  case 'keys': cmdKeys(rest[0]); break;
+  case 'handoff': cmdHandoff(flags(rest)); break;
+  case 'template': { const f = flags(rest); cmdTemplate(rest[0], (f.keys ? String(f.keys).split(',') : []).map((s) => s.trim()).filter(Boolean)); break; }
+  case 'fill': cmdFill(flags(rest)); break;
+  case 'verify': cmdVerify(flags(rest)); break;
+  case 'stash': cmdStash(flags(rest)); break;
+  case 'shred': cmdShred(rest[0]); break;
+  default:
+    console.log(HELP);
+    process.exit(1);
+}

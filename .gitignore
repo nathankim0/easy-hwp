@@ -13,4 +13,9 @@ Thumbs.db
 temp_*/
 
 # 템플릿 디렉토리 (개인 서식)
-templates/
+/templates/
+
+__pycache__/
+node_modules/
+.claw-hwp/
+outputs/
